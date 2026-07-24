@@ -27,6 +27,7 @@ import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -86,6 +87,14 @@ import org.apache.spark.unsafe.types.UTF8String;
  *   <li>(id=1, data='a', op='UPDATE_BEFORE')
  *   <li>(id=1, data='b', op='UPDATE_AFTER')
  * </ul>
+ *
+ * <p>On tables with format version 3 or higher, the procedure uses row lineage instead: a delete
+ * and an insert sharing the same {@code _row_id} within a change ordinal represent the same logical
+ * row, and the pair is a carry-over when the {@code _last_updated_sequence_number} is unchanged.
+ * Carry-over removal then shuffles by one long column instead of every data column, and pre/post
+ * update images no longer require identifier columns. Providing {@code identifier_columns}
+ * explicitly keeps the identifier-based behavior, which is also the fallback for tables whose files
+ * written before the upgrade to format version 3 carry no row lineage.
  */
 public class CreateChangelogViewProcedure extends BaseProcedure {
 
@@ -154,23 +163,33 @@ public class CreateChangelogViewProcedure extends BaseProcedure {
     Dataset<Row> df = loadRows(changelogTableIdent, options(input));
 
     boolean netChanges = input.asBoolean(NET_CHANGES, false);
-    String[] identifierColumns = identifierColumns(input, tableIdent);
-    Set<String> unorderableColumnNames =
-        Arrays.stream(df.schema().fields())
-            .filter(field -> !OrderUtils.isOrderable(field.dataType()))
-            .map(StructField::name)
-            .collect(Collectors.toSet());
+    boolean useLineage = shouldUseRowLineage(input, tableIdent, netChanges);
 
-    Preconditions.checkArgument(
-        identifierColumns.length > 0 || unorderableColumnNames.isEmpty(),
-        "Identifier field is required as table contains unorderable columns: %s",
-        unorderableColumnNames);
-
-    if (shouldComputeUpdateImages(input)) {
-      Preconditions.checkArgument(!netChanges, "Not support net changes with update images");
-      df = computeUpdateImages(identifierColumns, df);
+    if (useLineage) {
+      if (shouldComputeUpdateImages(input)) {
+        df = computeUpdateImagesWithLineage(df);
+      } else {
+        df = removeCarryoverRowsWithLineage(df);
+      }
     } else {
-      df = removeCarryoverRows(df, netChanges);
+      String[] identifierColumns = identifierColumns(input, tableIdent);
+      Set<String> unorderableColumnNames =
+          Arrays.stream(df.schema().fields())
+              .filter(field -> !OrderUtils.isOrderable(field.dataType()))
+              .map(StructField::name)
+              .collect(Collectors.toSet());
+
+      Preconditions.checkArgument(
+          identifierColumns.length > 0 || unorderableColumnNames.isEmpty(),
+          "Identifier field is required as table contains unorderable columns: %s",
+          unorderableColumnNames);
+
+      if (shouldComputeUpdateImages(input)) {
+        Preconditions.checkArgument(!netChanges, "Not support net changes with update images");
+        df = computeUpdateImages(identifierColumns, df);
+      } else {
+        df = removeCarryoverRows(df, netChanges);
+      }
     }
 
     String viewName = viewName(input, tableIdent.name());
@@ -178,6 +197,59 @@ public class CreateChangelogViewProcedure extends BaseProcedure {
     df.createOrReplaceTempView(viewName);
 
     return asScanIterator(OUTPUT_TYPE, toOutputRows(viewName));
+  }
+
+  /**
+   * Row lineage replaces both identifier columns and full-row comparison on tables with format
+   * version 3 or higher: a delete and an insert sharing {@code _row_id} within a change ordinal are
+   * the same logical row, and an unchanged {@code _last_updated_sequence_number} marks the pair as
+   * a carry-over. Explicitly provided identifier columns keep the identifier-based behavior, which
+   * is also the fallback for tables whose pre-upgrade files carry no lineage.
+   */
+  private boolean shouldUseRowLineage(
+      ProcedureInput input, Identifier tableIdent, boolean netChanges) {
+    if (input.isProvided(IDENTIFIER_COLUMNS_PARAM) || netChanges) {
+      return false;
+    }
+
+    Table table = loadSparkTable(tableIdent).table();
+    return TableUtil.supportsRowLineage(table);
+  }
+
+  private Dataset<Row> computeUpdateImagesWithLineage(Dataset<Row> df) {
+    return applyLineageIterator(df, true /* compute updates */);
+  }
+
+  private Dataset<Row> removeCarryoverRowsWithLineage(Dataset<Row> df) {
+    return applyLineageIterator(df, false /* keep delete/insert pairs */);
+  }
+
+  private Dataset<Row> applyLineageIterator(Dataset<Row> df, boolean computeUpdates) {
+    Dataset<Row> dfWithLineage =
+        df.select(
+            df.col("*"),
+            df.metadataColumn(MetadataColumns.ROW_ID.name()),
+            df.metadataColumn(MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.name()));
+
+    Column rowId = dfWithLineage.col(delimitedName(MetadataColumns.ROW_ID.name()));
+    Column changeOrdinal = dfWithLineage.col(delimitedName(MetadataColumns.CHANGE_ORDINAL.name()));
+    Column changeType = dfWithLineage.col(delimitedName(MetadataColumns.CHANGE_TYPE.name()));
+
+    Column[] repartitionSpec = new Column[] {rowId, changeOrdinal};
+    Column[] sortSpec = new Column[] {rowId, changeOrdinal, changeType};
+    StructType schema = dfWithLineage.schema();
+
+    return dfWithLineage
+        .repartition(repartitionSpec)
+        .sortWithinPartitions(sortSpec)
+        .mapPartitions(
+            (MapPartitionsFunction<Row, Row>)
+                rowIterator ->
+                    computeUpdates
+                        ? ChangelogIterator.computeUpdatesWithLineage(rowIterator, schema)
+                        : ChangelogIterator.removeCarryoversWithLineage(rowIterator, schema),
+            Encoders.row(schema))
+        .drop(MetadataColumns.ROW_ID.name(), MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.name());
   }
 
   private Dataset<Row> computeUpdateImages(String[] identifierColumns, Dataset<Row> df) {

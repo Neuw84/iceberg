@@ -23,13 +23,13 @@ import java.util.Map;
 import java.util.stream.Stream;
 import org.apache.iceberg.AddedRowsScanTask;
 import org.apache.iceberg.ChangelogScanTask;
-import org.apache.iceberg.ChangelogUtil;
 import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.ContentScanTask;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.DeletedDataFileScanTask;
 import org.apache.iceberg.DeletedRowsScanTask;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.ScanTaskGroup;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
@@ -38,10 +38,9 @@ import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.spark.rdd.InputFileBlockHolder;
 import org.apache.spark.sql.catalyst.InternalRow;
-import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
-import org.apache.spark.sql.catalyst.expressions.JoinedRow;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.unsafe.types.UTF8String;
 
@@ -65,35 +64,12 @@ class ChangelogRowReader extends BaseRowReader<ChangelogScanTask>
       Schema expectedSchema,
       boolean caseSensitive,
       boolean cacheDeleteFilesOnExecutors) {
-    super(
-        table,
-        fileIO,
-        taskGroup,
-        ChangelogUtil.dropChangelogMetadata(expectedSchema),
-        caseSensitive,
-        cacheDeleteFilesOnExecutors);
+    super(table, fileIO, taskGroup, expectedSchema, caseSensitive, cacheDeleteFilesOnExecutors);
   }
 
   @Override
   protected CloseableIterator<InternalRow> open(ChangelogScanTask task) {
-    JoinedRow cdcRow = new JoinedRow();
-
-    cdcRow.withRight(changelogMetadata(task));
-
-    CloseableIterable<InternalRow> rows = openChangelogScanTask(task);
-    CloseableIterable<InternalRow> cdcRows = CloseableIterable.transform(rows, cdcRow::withLeft);
-
-    return cdcRows.iterator();
-  }
-
-  private static InternalRow changelogMetadata(ChangelogScanTask task) {
-    InternalRow metadataRow = new GenericInternalRow(3);
-
-    metadataRow.update(0, UTF8String.fromString(task.operation().name()));
-    metadataRow.update(1, task.changeOrdinal());
-    metadataRow.update(2, task.commitSnapshotId());
-
-    return metadataRow;
+    return openChangelogScanTask(task).iterator();
   }
 
   private CloseableIterable<InternalRow> openChangelogScanTask(ChangelogScanTask task) {
@@ -115,18 +91,19 @@ class ChangelogRowReader extends BaseRowReader<ChangelogScanTask>
   CloseableIterable<InternalRow> openAddedRowsScanTask(AddedRowsScanTask task) {
     String filePath = task.file().location();
     SparkDeleteFilter deletes = new SparkDeleteFilter(filePath, task.deletes(), counter(), true);
-    return deletes.filter(rows(task, deletes.requiredSchema()));
+    return deletes.filter(rows(task, task, deletes.requiredSchema()));
   }
 
   private CloseableIterable<InternalRow> openDeletedDataFileScanTask(DeletedDataFileScanTask task) {
     String filePath = task.file().location();
     SparkDeleteFilter deletes =
         new SparkDeleteFilter(filePath, task.existingDeletes(), counter(), true);
-    return deletes.filter(rows(task, deletes.requiredSchema()));
+    return deletes.filter(rows(task, task, deletes.requiredSchema()));
   }
 
-  private CloseableIterable<InternalRow> rows(ContentScanTask<DataFile> task, Schema readSchema) {
-    Map<Integer, ?> idToConstant = constantsMap(task, readSchema);
+  private CloseableIterable<InternalRow> rows(
+      ContentScanTask<DataFile> task, ChangelogScanTask changeTask, Schema readSchema) {
+    Map<Integer, ?> idToConstant = changelogConstantsMap(task, changeTask, readSchema);
 
     String filePath = task.file().location();
 
@@ -143,6 +120,24 @@ class ChangelogRowReader extends BaseRowReader<ChangelogScanTask>
         task.residual(),
         readSchema,
         idToConstant);
+  }
+
+  /**
+   * Extends the regular task constants with the changelog metadata values. The changelog columns
+   * are constant per {@link ChangelogScanTask}, so resolving them like other metadata constants
+   * places them at their projected positions for any column order, including projections where
+   * Spark appends metadata columns such as {@code _row_id} after the changelog columns.
+   */
+  private Map<Integer, ?> changelogConstantsMap(
+      ContentScanTask<DataFile> task, ChangelogScanTask changeTask, Schema readSchema) {
+    Map<Integer, Object> idToConstant = Maps.newHashMap();
+    idToConstant.putAll(constantsMap(task, readSchema));
+    idToConstant.put(
+        MetadataColumns.CHANGE_TYPE.fieldId(),
+        UTF8String.fromString(changeTask.operation().name()));
+    idToConstant.put(MetadataColumns.CHANGE_ORDINAL.fieldId(), changeTask.changeOrdinal());
+    idToConstant.put(MetadataColumns.COMMIT_SNAPSHOT_ID.fieldId(), changeTask.commitSnapshotId());
+    return idToConstant;
   }
 
   @Override

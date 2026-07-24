@@ -18,11 +18,14 @@
  */
 package org.apache.iceberg.spark.source;
 
+import java.util.List;
 import java.util.Set;
 import org.apache.iceberg.ChangelogUtil;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.SparkSchemaUtil;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.connector.catalog.MetadataColumn;
@@ -86,12 +89,19 @@ public class SparkChangelogTable
 
   @Override
   public MetadataColumn[] metadataColumns() {
-    return new MetadataColumn[] {
-      SparkMetadataColumns.SPEC_ID,
-      SparkMetadataColumns.partition(table),
-      SparkMetadataColumns.FILE_PATH,
-      SparkMetadataColumns.ROW_POSITION,
-      SparkMetadataColumns.IS_DELETED,
-    };
+    List<SparkMetadataColumn> cols = Lists.newArrayList();
+
+    cols.add(SparkMetadataColumns.SPEC_ID);
+    cols.add(SparkMetadataColumns.partition(table));
+    cols.add(SparkMetadataColumns.FILE_PATH);
+    cols.add(SparkMetadataColumns.ROW_POSITION);
+    cols.add(SparkMetadataColumns.IS_DELETED);
+
+    if (TableUtil.supportsRowLineage(table)) {
+      cols.add(SparkMetadataColumns.ROW_ID);
+      cols.add(SparkMetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER);
+    }
+
+    return cols.toArray(SparkMetadataColumn[]::new);
   }
 }

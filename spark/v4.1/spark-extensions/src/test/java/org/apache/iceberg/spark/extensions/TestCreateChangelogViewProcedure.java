@@ -691,4 +691,192 @@ public class TestCreateChangelogViewProcedure extends ExtensionsTestBase {
         .hasMessageContaining(
             "Identifier field is required as table contains unorderable columns: [data]");
   }
+
+  private void createV3TableWithTwoColumns() {
+    sql(
+        "CREATE TABLE %s (id INT, data STRING) USING iceberg"
+            + " TBLPROPERTIES ('format-version'='3')",
+        tableName);
+  }
+
+  @TestTemplate
+  public void testUpdateImagesWithLineage() {
+    createV3TableWithTwoColumns();
+    sql("INSERT INTO %s VALUES (1, 'a'), (2, 'b'), (3, 'c')", tableName);
+    Table table = validationCatalog.loadTable(tableIdent);
+    Snapshot snap1 = table.currentSnapshot();
+
+    // copy-on-write update rewrites the whole file: rows 1 and 3 become carry-overs
+    sql("UPDATE %s SET data = 'x' WHERE id = 2", tableName);
+    table.refresh();
+    Snapshot snap2 = table.currentSnapshot();
+
+    // no identifier columns: pre/post update images are paired by _row_id
+    List<Object[]> returns =
+        sql(
+            "CALL %s.system.create_changelog_view(table => '%s', compute_updates => true)",
+            catalogName, tableName);
+
+    String viewName = (String) returns.get(0)[0];
+    assertEquals(
+        "Rows should match",
+        ImmutableList.of(
+            row(1, "a", INSERT, 0, snap1.snapshotId()),
+            row(2, "b", INSERT, 0, snap1.snapshotId()),
+            row(3, "c", INSERT, 0, snap1.snapshotId()),
+            row(2, "b", UPDATE_BEFORE, 1, snap2.snapshotId()),
+            row(2, "x", UPDATE_AFTER, 1, snap2.snapshotId())),
+        sql("select * from %s order by _change_ordinal, id, data", viewName));
+  }
+
+  @TestTemplate
+  public void testRemoveCarryoversWithLineage() {
+    createV3TableWithTwoColumns();
+    sql("INSERT INTO %s VALUES (1, 'a'), (2, 'b'), (3, 'c')", tableName);
+    Table table = validationCatalog.loadTable(tableIdent);
+    Snapshot snap1 = table.currentSnapshot();
+
+    sql("UPDATE %s SET data = 'x' WHERE id = 2", tableName);
+    table.refresh();
+    Snapshot snap2 = table.currentSnapshot();
+
+    // carry-overs are removed by lineage, delete/insert pairs of updated rows are kept
+    List<Object[]> returns =
+        sql("CALL %s.system.create_changelog_view(table => '%s')", catalogName, tableName);
+
+    String viewName = (String) returns.get(0)[0];
+    assertEquals(
+        "Rows should match",
+        ImmutableList.of(
+            row(1, "a", INSERT, 0, snap1.snapshotId()),
+            row(2, "b", INSERT, 0, snap1.snapshotId()),
+            row(3, "c", INSERT, 0, snap1.snapshotId()),
+            row(2, "b", DELETE, 1, snap2.snapshotId()),
+            row(2, "x", INSERT, 1, snap2.snapshotId())),
+        sql("select * from %s order by _change_ordinal, id, data", viewName));
+  }
+
+  @TestTemplate
+  public void testDeleteWithLineage() {
+    createV3TableWithTwoColumns();
+    sql("INSERT INTO %s VALUES (1, 'a'), (2, 'b'), (3, 'c')", tableName);
+    Table table = validationCatalog.loadTable(tableIdent);
+    Snapshot snap1 = table.currentSnapshot();
+
+    sql("DELETE FROM %s WHERE id = 2", tableName);
+    table.refresh();
+    Snapshot snap2 = table.currentSnapshot();
+
+    List<Object[]> returns =
+        sql("CALL %s.system.create_changelog_view(table => '%s')", catalogName, tableName);
+
+    String viewName = (String) returns.get(0)[0];
+    assertEquals(
+        "Rows should match",
+        ImmutableList.of(
+            row(1, "a", INSERT, 0, snap1.snapshotId()),
+            row(2, "b", INSERT, 0, snap1.snapshotId()),
+            row(3, "c", INSERT, 0, snap1.snapshotId()),
+            row(2, "b", DELETE, 1, snap2.snapshotId())),
+        sql("select * from %s order by _change_ordinal, id, data", viewName));
+  }
+
+  @TestTemplate
+  public void testOverwriteWithLineageIsDeleteAndInsert() {
+    createV3TableWithTwoColumns();
+    sql("ALTER TABLE %s ADD PARTITION FIELD id", tableName);
+    sql("INSERT INTO %s VALUES (1, 'a'), (2, 'b')", tableName);
+    Table table = validationCatalog.loadTable(tableIdent);
+    Snapshot snap1 = table.currentSnapshot();
+
+    sql("INSERT OVERWRITE %s VALUES (2, 'd')", tableName);
+    table.refresh();
+    Snapshot snap2 = table.currentSnapshot();
+
+    // an overwrite writes new rows with fresh row ids, so lineage reports a delete and an
+    // insert instead of pairing them like identifier-based computation would
+    List<Object[]> returns =
+        sql(
+            "CALL %s.system.create_changelog_view(table => '%s', compute_updates => true)",
+            catalogName, tableName);
+
+    String viewName = (String) returns.get(0)[0];
+    assertEquals(
+        "Rows should match",
+        ImmutableList.of(
+            row(1, "a", INSERT, 0, snap1.snapshotId()),
+            row(2, "b", INSERT, 0, snap1.snapshotId()),
+            row(2, "b", DELETE, 1, snap2.snapshotId()),
+            row(2, "d", INSERT, 1, snap2.snapshotId())),
+        sql("select * from %s order by _change_ordinal, id, data", viewName));
+  }
+
+  @TestTemplate
+  public void testExplicitIdentifierColumnsOnV3TableUseIdentifierPairing() {
+    createV3TableWithTwoColumns();
+    sql("ALTER TABLE %s ADD PARTITION FIELD id", tableName);
+    sql("INSERT INTO %s VALUES (1, 'a'), (2, 'b')", tableName);
+    Table table = validationCatalog.loadTable(tableIdent);
+    Snapshot snap1 = table.currentSnapshot();
+
+    sql("INSERT OVERWRITE %s VALUES (2, 'd')", tableName);
+    table.refresh();
+    Snapshot snap2 = table.currentSnapshot();
+
+    // explicitly provided identifier columns keep identifier-based pairing on v3 tables
+    List<Object[]> returns =
+        sql(
+            "CALL %s.system.create_changelog_view(table => '%s', identifier_columns =>"
+                + " array('id'))",
+            catalogName, tableName);
+
+    String viewName = (String) returns.get(0)[0];
+    assertEquals(
+        "Rows should match",
+        ImmutableList.of(
+            row(1, "a", INSERT, 0, snap1.snapshotId()),
+            row(2, "b", INSERT, 0, snap1.snapshotId()),
+            row(2, "b", UPDATE_BEFORE, 1, snap2.snapshotId()),
+            row(2, "d", UPDATE_AFTER, 1, snap2.snapshotId())),
+        sql("select * from %s order by _change_ordinal, id, data", viewName));
+  }
+
+  @TestTemplate
+  public void testUnorderableColumnsWorkWithLineage() {
+    // maps are unorderable, so identifier-less changelog views are rejected on v2 tables;
+    // lineage shuffles by _row_id only and does not order by data columns
+    sql(
+        "CREATE TABLE %s (id INT, data MAP<STRING,STRING>) USING iceberg"
+            + " TBLPROPERTIES ('format-version'='3')",
+        tableName);
+    sql("INSERT INTO %s VALUES (1, map('k', 'a')), (2, map('k', 'b'))", tableName);
+
+    sql("DELETE FROM %s WHERE id = 2", tableName);
+
+    List<Object[]> returns =
+        sql("CALL %s.system.create_changelog_view(table => '%s')", catalogName, tableName);
+
+    String viewName = (String) returns.get(0)[0];
+    assertEquals(
+        "Rows should match",
+        ImmutableList.of(row(1, INSERT), row(2, INSERT), row(2, DELETE)),
+        sql("select id, _change_type from %s order by _change_ordinal, id", viewName));
+  }
+
+  @TestTemplate
+  public void testPreUpgradeFilesFailWithLineageGuidance() {
+    // files written before the upgrade to format version 3 carry no row lineage
+    sql("CREATE TABLE %s (id INT, data STRING) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, 'a'), (2, 'b'), (3, 'c')", tableName);
+    sql("ALTER TABLE %s SET TBLPROPERTIES ('format-version'='3')", tableName);
+
+    sql("UPDATE %s SET data = 'x' WHERE id = 2", tableName);
+
+    List<Object[]> returns =
+        sql("CALL %s.system.create_changelog_view(table => '%s')", catalogName, tableName);
+
+    String viewName = (String) returns.get(0)[0];
+    assertThatThrownBy(() -> sql("select * from %s", viewName))
+        .hasStackTraceContaining("identifier_columns");
+  }
 }

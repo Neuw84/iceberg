@@ -98,6 +98,41 @@ public abstract class ChangelogIterator implements Iterator<Row> {
     return Iterators.filter(changelogIterator, Objects::nonNull);
   }
 
+  /**
+   * Creates an iterator that removes carry-over rows and computes update rows based on row lineage.
+   * It requires rows to be sorted by ({@code _row_id}, {@code _change_ordinal}, {@code
+   * _change_type}) and is available for tables on format version 3 or higher.
+   *
+   * @param rowIterator the iterator of rows from a changelog table
+   * @param rowType the schema of the rows, which must include {@code _row_id} and {@code
+   *     _last_updated_sequence_number}
+   * @return a new iterator instance
+   */
+  public static Iterator<Row> computeUpdatesWithLineage(
+      Iterator<Row> rowIterator, StructType rowType) {
+    ChangelogIterator changelogIterator =
+        new LineageChangelogIterator(rowIterator, rowType, true /* compute updates */);
+    return Iterators.filter(changelogIterator, Objects::nonNull);
+  }
+
+  /**
+   * Creates an iterator that removes carry-over rows based on row lineage, keeping delete/insert
+   * pairs of updated rows as-is. It requires rows to be sorted by ({@code _row_id}, {@code
+   * _change_ordinal}, {@code _change_type}) and is available for tables on format version 3 or
+   * higher.
+   *
+   * @param rowIterator the iterator of rows from a changelog table
+   * @param rowType the schema of the rows, which must include {@code _row_id} and {@code
+   *     _last_updated_sequence_number}
+   * @return a new iterator instance
+   */
+  public static Iterator<Row> removeCarryoversWithLineage(
+      Iterator<Row> rowIterator, StructType rowType) {
+    ChangelogIterator changelogIterator =
+        new LineageChangelogIterator(rowIterator, rowType, false /* keep delete/insert pairs */);
+    return Iterators.filter(changelogIterator, Objects::nonNull);
+  }
+
   protected boolean isSameRecord(Row currentRow, Row nextRow, int[] indicesToIdentifySameRow) {
     for (int idx : indicesToIdentifySameRow) {
       if (isDifferentValue(currentRow, nextRow, idx)) {
